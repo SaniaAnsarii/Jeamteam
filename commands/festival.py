@@ -80,13 +80,13 @@ class FestivalCog(commands.Cog):
 
     # -- /adddesign -----------------------------------------------------------
     @app_commands.command(name="adddesign", description="Add a design to the current festival (admin)")
-    @app_commands.describe(name="Design name or title", submitter="Who submitted this design")
+    @app_commands.describe(name="Design name or title", submitter="Who submitted this design (required)")
     @is_admin()
     async def adddesign(
         self,
         interaction: discord.Interaction,
         name: str,
-        submitter: discord.Member | None = None,
+        submitter: discord.Member,
     ):
         festival = db.get_active_festival(interaction.guild_id)
         if not festival or festival["status"] != "setup":
@@ -96,12 +96,10 @@ class FestivalCog(commands.Cog):
             )
             return
 
-        submitter_id = submitter.id if submitter else None
-        design_id, number = db.add_design(festival["id"], name, submitter_id)
+        design_id, number = db.add_design(festival["id"], name, submitter.id)
 
-        who = f" — {submitter.mention}" if submitter else ""
         await interaction.response.send_message(
-            f"✅ Added **Design {number}: {name}**{who}", ephemeral=True
+            f"✅ Added **Design {number}: {name}** — {submitter.mention}", ephemeral=True
         )
 
     # -- /editdesign ----------------------------------------------------------

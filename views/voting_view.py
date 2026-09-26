@@ -87,6 +87,19 @@ class VotingPanelView(discord.ui.View):
             )
             return
 
+        # Safety-net check: the dropdowns already exclude the voter's own
+        # design(s), but re-verify here in case a design's submitter was
+        # changed (via /editdesign) after this panel was opened.
+        for design_id in (first_id, second_id, third_id):
+            design = db.get_design(design_id)
+            if design and design["submitter_id"] == interaction.user.id:
+                await interaction.response.send_message(
+                    "⚠️ You can't vote for your own design. Please reopen "
+                    "**Cast Your Vote** and choose again.",
+                    ephemeral=True,
+                )
+                return
+
         if db.has_voted(self.festival_id, interaction.user.id):
             await interaction.response.send_message(
                 "⚠️ You have already voted in this Design Festival. You cannot change your vote.",
@@ -143,16 +156,26 @@ class CastVoteButton(discord.ui.Button):
             return
 
         designs = db.get_designs(festival["id"])
-        if len(designs) < 3:
-            await interaction.response.send_message(
-                "⚠️ Not enough designs have been added yet.", ephemeral=True
-            )
+        eligible_designs = [d for d in designs if d["submitter_id"] != interaction.user.id]
+
+        if len(eligible_designs) < 3:
+            if len(eligible_designs) < len(designs):
+                await interaction.response.send_message(
+                    "⚠️ You can't vote — there aren't at least 3 designs left once your "
+                    "own submission(s) are excluded.",
+                    ephemeral=True,
+                )
+            else:
+                await interaction.response.send_message(
+                    "⚠️ Not enough designs have been added yet.", ephemeral=True
+                )
             return
 
-        panel = VotingPanelView(festival["id"], designs)
+        panel = VotingPanelView(festival["id"], eligible_designs)
         embed = discord.Embed(
             title="🏆 DESIGN FESTIVAL — YOUR VOTE",
-            description="Pick a different design for each rank, then press **Submit Vote**.",
+            description="Pick a different design for each rank, then press **Submit Vote**.\n"
+            "-# Your own submitted design (if any) won't appear here.",
             color=discord.Color.blurple(),
         )
         await interaction.response.send_message(embed=embed, view=panel, ephemeral=True)
