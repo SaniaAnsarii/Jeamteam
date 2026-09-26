@@ -8,6 +8,7 @@ Slash commands for the design festival voting system:
     /deletedesign (admin role)   - remove a design before voting opens
     /startvote    (admin role)   - post the public voting message and open voting
     /results      (admin role)   - compute and display results
+    /ballots      (admin role)   - see exactly who voted for what (breaks anonymity)
     /endvote      (admin role)   - close voting
 
 Permission model:
@@ -18,6 +19,8 @@ Permission model:
       EXCEPT the voting flow itself — anyone in the server can click
       "Cast Your Vote" and vote, regardless of role.
 """
+
+import io
 
 import discord
 from discord import app_commands
@@ -194,6 +197,56 @@ class FestivalCog(commands.Cog):
             f"Note: remaining design numbers were not renumbered.",
             ephemeral=True,
         )
+
+    # -- /ballots -------------------------------------------------------------
+    @app_commands.command(
+        name="ballots",
+        description="See exactly who voted for what — breaks anonymity, admin only",
+    )
+    @is_admin()
+    async def ballots(self, interaction: discord.Interaction):
+        festival = db.get_latest_festival(interaction.guild_id)
+        if not festival:
+            await interaction.response.send_message(
+                "⚠️ There's no festival yet.", ephemeral=True
+            )
+            return
+
+        ballots = db.get_ballots(festival["id"])
+        if not ballots:
+            await interaction.response.send_message(
+                "No ballots have been cast yet.", ephemeral=True
+            )
+            return
+
+        lines = []
+        for b in ballots:
+            lines.append(
+                f"<@{b['user_id']}>: "
+                f"🥇 Design {b['first_number']} ({b['first_name']}) — "
+                f"🥈 Design {b['second_number']} ({b['second_name']}) — "
+                f"🥉 Design {b['third_number']} ({b['third_name']})"
+            )
+        full_text = "\n".join(lines)
+
+        header = f"🗳️ {len(ballots)} ballot(s) cast in festival #{festival['id']}\n\n"
+
+        if len(header) + len(full_text) <= 4000:
+            embed = discord.Embed(
+                title="Ballots (admin only)",
+                description=header + full_text,
+                color=discord.Color.orange(),
+            )
+            await interaction.response.send_message(embed=embed, ephemeral=True)
+        else:
+            # Too many to fit in an embed — send as a text file instead.
+            buffer = io.BytesIO((header + full_text).encode("utf-8"))
+            file = discord.File(buffer, filename=f"ballots_festival_{festival['id']}.txt")
+            await interaction.response.send_message(
+                f"🗳️ {len(ballots)} ballot(s) — too many to show inline, see attached file.",
+                file=file,
+                ephemeral=True,
+            )
 
     # -- /startvote -----------------------------------------------------------
     @app_commands.command(name="startvote", description="Post the festival and open voting (admin)")

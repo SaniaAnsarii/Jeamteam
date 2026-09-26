@@ -239,6 +239,30 @@ def get_vote_count(festival_id: int) -> int:
         return row["c"]
 
 
+def get_ballots(festival_id: int):
+    """Returns every individual ballot for this festival, each with the voter's
+    user_id and their three picks (design number + name for each rank).
+    Admin-only use — this breaks per-vote anonymity by design."""
+    with get_conn() as conn:
+        rows = conn.execute(
+            """
+            SELECT
+                v.user_id,
+                d1.number AS first_number,  d1.name AS first_name,
+                d2.number AS second_number, d2.name AS second_name,
+                d3.number AS third_number,  d3.name AS third_name
+            FROM votes v
+            JOIN designs d1 ON d1.id = v.first_design_id
+            JOIN designs d2 ON d2.id = v.second_design_id
+            JOIN designs d3 ON d3.id = v.third_design_id
+            WHERE v.festival_id = ?
+            ORDER BY v.id
+            """,
+            (festival_id,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
 # ---------------------------------------------------------------------------
 # Settings (per-guild admin role for festival management)
 # ---------------------------------------------------------------------------
