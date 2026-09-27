@@ -4,6 +4,7 @@ Slash commands for the design festival voting system:
     /setadminrole (server admin) - choose which role can manage festivals
     /setupvote    (admin role)   - start a new festival in this channel
     /adddesign    (admin role)   - add one design to the festival being set up
+    /adddesigns   (admin role)   - add multiple designs at once, one per line
     /editdesign   (admin role)   - edit a design's name/submitter
     /deletedesign (admin role)   - remove a design before voting opens
     /startvote    (admin role)   - post the public voting message and open voting
@@ -21,6 +22,7 @@ Permission model:
 """
 
 import io
+import re
 
 import discord
 from discord import app_commands
@@ -40,6 +42,43 @@ def is_admin():
         return any(role.id == admin_role_id for role in interaction.user.roles)
 
     return app_commands.check(predicate)
+
+
+_MENTION_RE = re.compile(r"<@!?(\d+)>")
+
+
+def _parse_bulk_entries(raw: str) -> tuple[list[tuple[str, int]], list[str]]:
+    """Parses one design per line, formatted as:  Design Name - @submitter
+    (order of name/mention doesn't matter, and '-' or '|' both work as the
+    separator). Returns (parsed, problem_lines) where parsed is a list of
+    (name, submitter_id) tuples ready for db.add_design, and problem_lines
+    lists the raw lines that couldn't be parsed (no mention found, or the
+    remaining text was empty after stripping the mention/separator)."""
+    parsed: list[tuple[str, int]] = []
+    problems: list[str] = []
+
+    for raw_line in raw.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+
+        match = _MENTION_RE.search(line)
+        if not match:
+            problems.append(raw_line)
+            continue
+
+        submitter_id = int(match.group(1))
+        name = _MENTION_RE.sub("", line)
+        # Strip a leading/trailing separator left over once the mention is gone.
+        name = re.sub(r"^\s*[-|:]\s*|\s*[-|:]\s*$", "", name).strip()
+
+        if not name:
+            problems.append(raw_line)
+            continue
+
+        parsed.append((name, submitter_id))
+
+    return parsed, problems
 
 
 class FestivalCog(commands.Cog):
@@ -104,6 +143,52 @@ class FestivalCog(commands.Cog):
         await interaction.response.send_message(
             f"✅ Added **Design {number}: {name}** — {submitter.mention}", ephemeral=True
         )
+
+    # -- /adddesigns (bulk) -----------------------------------------------------
+    @app_commands.command(
+        name="adddesigns",
+        description="Add multiple designs at once, one per line (admin)",
+    )
+    @app_commands.describe(
+        entries=(
+            "One design per line, e.g.:  Design A - @Sania  (mention picker works "
+            "inside this field — type @ and pick the user, one line per design)"
+        )
+    )
+    @is_admin()
+    async def adddesigns(self, interaction: discord.Interaction, entries: str):
+        festival = db.get_active_festival(interaction.guild_id)
+        if not festival or festival["status"] != "setup":
+            await interaction.response.send_message(
+                "⚠️ No festival is currently being set up. Run `/setupvote` first.",
+                ephemeral=True,
+            )
+            return
+
+        parsed, problems = _parse_bulk_entries(entries)
+
+        if not parsed:
+            await interaction.response.send_message(
+                "⚠️ Couldn't parse any designs. Use one per line, e.g.:\n"
+                "`Design A - @Sania`\n`Design B - @Twan`\n"
+                "(type `@` inside the field and pick the user so it becomes a real mention).",
+                ephemeral=True,
+            )
+            return
+
+        added_lines = []
+        for name, submitter_id in parsed:
+            _, number = db.add_design(festival["id"], name, submitter_id)
+            added_lines.append(f"Design {number}: {name} — <@{submitter_id}>")
+
+        message = f"✅ Added {len(parsed)} design(s):\n" + "\n".join(added_lines)
+        if problems:
+            message += (
+                f"\n\n⚠️ Skipped {len(problems)} line(s) — no valid `@mention` found:\n"
+                + "\n".join(f"`{p}`" for p in problems)
+            )
+
+        await interaction.response.send_message(message[:2000], ephemeral=True)
 
     # -- /editdesign ----------------------------------------------------------
     @app_commands.command(name="editdesign", description="Edit a design's name and/or submitter (admin)")

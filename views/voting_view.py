@@ -90,6 +90,7 @@ class VotingPanelView(discord.ui.View):
         # Safety-net check: the dropdowns already exclude the voter's own
         # design(s), but re-verify here in case a design's submitter was
         # changed (via /editdesign) after this panel was opened.
+        picked_designs = []
         for design_id in (first_id, second_id, third_id):
             design = db.get_design(design_id)
             if design and design["submitter_id"] == interaction.user.id:
@@ -99,6 +100,19 @@ class VotingPanelView(discord.ui.View):
                     ephemeral=True,
                 )
                 return
+            picked_designs.append(design)
+
+        # A single submitter can have multiple designs entered (e.g. via
+        # /adddesigns), but one voter can't give the same person more than
+        # one of their three ranks.
+        submitter_ids = [d["submitter_id"] for d in picked_designs if d and d["submitter_id"]]
+        if len(submitter_ids) != len(set(submitter_ids)):
+            await interaction.response.send_message(
+                "⚠️ Two or more of your picks were submitted by the same person. "
+                "Each of your three ranks must go to a different submitter.",
+                ephemeral=True,
+            )
+            return
 
         if db.has_voted(self.festival_id, interaction.user.id):
             await interaction.response.send_message(

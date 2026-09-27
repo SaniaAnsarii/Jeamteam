@@ -10,7 +10,6 @@ from views.voting_view import FestivalPostView
 load_dotenv()
 
 TOKEN = os.getenv("DISCORD_TOKEN")
-GUILD_ID_RAW = os.getenv("GUILD_ID")  # set this in .env for instant (guild-scoped) command sync
 
 intents = discord.Intents.default()
 
@@ -27,19 +26,31 @@ async def setup_hook():
 
     await bot.load_extension("commands.festival")
 
-    if GUILD_ID_RAW:
-        guild = discord.Object(id=int(GUILD_ID_RAW))
-        bot.tree.copy_global_to(guild=guild)
-        synced = await bot.tree.sync(guild=guild)
-        print(f"✅ Synced {len(synced)} command(s) to guild {GUILD_ID_RAW}")
-    else:
-        synced = await bot.tree.sync()
-        print(f"✅ Synced {len(synced)} command(s) globally (can take up to 1 hour to appear)")
+
+async def sync_guild(guild: discord.Guild):
+    """Copies the global command tree into one guild and syncs it there —
+    this is what makes commands show up instantly (vs. up to an hour for a
+    pure global sync)."""
+    bot.tree.copy_global_to(guild=guild)
+    synced = await bot.tree.sync(guild=guild)
+    print(f"✅ Synced {len(synced)} command(s) to '{guild.name}' ({guild.id})")
 
 
 @bot.event
 async def on_ready():
     print(f"✅ Logged in as {bot.user}")
+    # bot.guilds is only reliably populated once the gateway connects, so
+    # this is done here rather than in setup_hook.
+    for guild in bot.guilds:
+        await sync_guild(guild)
+    print(f"✅ Bot is active in {len(bot.guilds)} server(s)")
+
+
+@bot.event
+async def on_guild_join(guild: discord.Guild):
+    # Whenever someone invites the bot to a new server, register commands
+    # there immediately instead of waiting for a restart.
+    await sync_guild(guild)
 
 
 bot.run(TOKEN)
