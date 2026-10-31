@@ -547,7 +547,7 @@ class FestivalCog(commands.Cog):
                 "🥉 Third Choice — **1 point**\n\n"
                 "Your votes are anonymous, and you get **one ballot**.\n"
                 "You can't vote for your own design.\n\n"
-                "**Designs** (tap a number to jump to its image)\n" + "\n".join(lines)
+                "**Designs**\n" + "\n".join(lines)
             ),
             color=discord.Color.gold(),
         )
