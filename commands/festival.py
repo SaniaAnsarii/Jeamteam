@@ -2,9 +2,12 @@
 commands/festival.py
 Slash commands for the design festival voting system:
     /setadminrole (server admin) - choose which role can manage festivals
-    /setupvote    (admin role)   - start a new festival in this channel
-    /adddesign    (admin role)   - add one design to the festival being set up
-    /adddesigns   (admin role)   - add multiple designs at once, one per line
+    /setupvote    (admin role)   - start a new festival (option: show submitters publicly)
+    /showsubmitters (admin role) - toggle showing @submitters in the public post (setup only)
+    /adddesign    (admin role)   - post a design image anonymously (public post shows only
+                                   its number) and add it to the vote
+    /adddesigns   (admin role)   - add several image-less designs at once, one per line
+    /designs      (admin role)   - private list of which number belongs to whom
     /editdesign   (admin role)   - edit a design's name/submitter
     /deletedesign (admin role)   - remove a design before voting opens
     /startvote    (admin role)   - post the public voting message and open voting
@@ -22,6 +25,7 @@ Permission model:
 """
 
 import io
+import os
 import re
 
 import discord
@@ -45,6 +49,22 @@ def is_admin():
 
 
 _MENTION_RE = re.compile(r"<@!?(\d+)>")
+
+
+def _jump_url(guild_id: int, design: dict) -> str | None:
+    """Link to the bot's public image post for a design (None if it has no image)."""
+    if design.get("image_channel_id") and design.get("image_message_id"):
+        return (
+            f"https://discord.com/channels/{guild_id}/"
+            f"{design['image_channel_id']}/{design['image_message_id']}"
+        )
+    return None
+
+
+def _design_label(number: int, submitter_id: int | None) -> str:
+    """Admin-only label: "Design 3 (@user)"."""
+    who = f" (<@{submitter_id}>)" if submitter_id else ""
+    return f"Design {number}{who}"
 
 
 def _parse_bulk_entries(raw: str) -> tuple[list[tuple[str, int]], list[str]]:
@@ -102,8 +122,13 @@ class FestivalCog(commands.Cog):
 
     # -- /setupvote ---------------------------------------------------------
     @app_commands.command(name="setupvote", description="Start a new Design Festival (admin)")
+    @app_commands.describe(
+        show_submitters="Show each design's @submitter in the public post? Default: No (anonymous)"
+    )
     @is_admin()
-    async def setupvote(self, interaction: discord.Interaction):
+    async def setupvote(
+        self, interaction: discord.Interaction, show_submitters: bool = False
+    ):
         existing = db.get_active_festival(interaction.guild_id)
         if existing:
             await interaction.response.send_message(
@@ -113,22 +138,63 @@ class FestivalCog(commands.Cog):
             )
             return
 
-        festival_id = db.create_festival(interaction.guild_id, interaction.channel_id)
+        festival_id = db.create_festival(
+            interaction.guild_id, interaction.channel_id, show_submitters
+        )
+        visibility = (
+            "the public post will **show** each @submitter"
+            if show_submitters
+            else "the public post will **hide** submitters (numbers only)"
+        )
         await interaction.response.send_message(
-            f"✅ Festival #{festival_id} created! Now add designs with `/adddesign`, "
-            f"then run `/startvote` when you're ready to open voting.",
+            f"✅ Festival #{festival_id} created — {visibility}. Now add designs with "
+            f"`/adddesign` (a submitter is always required, so people can't vote for "
+            f"themselves), then run `/startvote` when you're ready to open voting.\n"
+            f"-# Change your mind? `/showsubmitters` works until voting starts.",
+            ephemeral=True,
+        )
+
+    # -- /showsubmitters --------------------------------------------------------
+    @app_commands.command(
+        name="showsubmitters",
+        description="Choose whether the public post shows each design's @submitter (admin)",
+    )
+    @app_commands.describe(show="Yes = show @submitters publicly, No = numbers only")
+    @is_admin()
+    async def showsubmitters(self, interaction: discord.Interaction, show: bool):
+        festival = db.get_active_festival(interaction.guild_id)
+        if not festival or festival["status"] != "setup":
+            await interaction.response.send_message(
+                "⚠️ This can only be changed while a festival is being set up — once "
+                "`/startvote` has posted the public message it can't be changed.",
+                ephemeral=True,
+            )
+            return
+
+        db.set_show_submitters(festival["id"], show)
+        await interaction.response.send_message(
+            "✅ The public post will now "
+            + ("**show** each @submitter." if show else "**hide** submitters (numbers only)."),
             ephemeral=True,
         )
 
     # -- /adddesign -----------------------------------------------------------
-    @app_commands.command(name="adddesign", description="Add a design to the current festival (admin)")
-    @app_commands.describe(name="Design name or title", submitter="Who submitted this design (required)")
+    @app_commands.command(
+        name="adddesign",
+        description="Post a design image anonymously and add it to the vote (admin)",
+    )
+    @app_commands.describe(
+        image="The design image to post",
+        submitter="Who made it (stays private — the public post only shows the number)",
+        number="Optional: choose the design number (default: next free number)",
+    )
     @is_admin()
     async def adddesign(
         self,
         interaction: discord.Interaction,
-        name: str,
+        image: discord.Attachment,
         submitter: discord.Member,
+        number: int | None = None,
     ):
         festival = db.get_active_festival(interaction.guild_id)
         if not festival or festival["status"] != "setup":
@@ -138,16 +204,73 @@ class FestivalCog(commands.Cog):
             )
             return
 
-        design_id, number = db.add_design(festival["id"], name, submitter.id)
+        if not (image.content_type or "").startswith("image/"):
+            await interaction.response.send_message(
+                "⚠️ That file isn't an image. Attach a PNG, JPG, GIF or WEBP.",
+                ephemeral=True,
+            )
+            return
 
-        await interaction.response.send_message(
-            f"✅ Added **Design {number}: {name}** — {submitter.mention}", ephemeral=True
+        if number is None:
+            number = db.next_design_number(festival["id"])
+        elif number < 1:
+            await interaction.response.send_message(
+                "⚠️ The design number must be 1 or higher.", ephemeral=True
+            )
+            return
+        elif db.design_number_taken(festival["id"], number):
+            await interaction.response.send_message(
+                f"⚠️ Design {number} already exists. Pick another number, "
+                f"or leave it blank for the next free one.",
+                ephemeral=True,
+            )
+            return
+
+        # Uploading + posting can take a moment.
+        await interaction.response.defer(ephemeral=True)
+
+        extension = os.path.splitext(image.filename)[1].lower() or ".png"
+        filename = f"design_{number}{extension}"
+        try:
+            file = await image.to_file(filename=filename)
+            embed = discord.Embed(title=f"🖼️ Design {number}", color=discord.Color.gold())
+            embed.set_image(url=f"attachment://{filename}")
+            post = await interaction.channel.send(embed=embed, file=file)
+        except discord.Forbidden:
+            await interaction.followup.send(
+                "⚠️ I can't post in this channel. I need **Send Messages**, "
+                "**Embed Links** and **Attach Files** here.",
+                ephemeral=True,
+            )
+            return
+        except discord.HTTPException as error:
+            await interaction.followup.send(
+                f"⚠️ Discord rejected the upload (error {error.status}). "
+                f"The image may be too large.",
+                ephemeral=True,
+            )
+            return
+
+        # The name column is unused for image designs — the number IS the public label.
+        db.add_design(
+            festival["id"],
+            "",
+            submitter.id,
+            number=number,
+            image_channel_id=post.channel.id,
+            image_message_id=post.id,
+        )
+
+        await interaction.followup.send(
+            f"✅ Posted **Design {number}** — made by {submitter.mention} "
+            f"(private, the public post only shows the number). It's now in the vote.",
+            ephemeral=True,
         )
 
     # -- /adddesigns (bulk) -----------------------------------------------------
     @app_commands.command(
         name="adddesigns",
-        description="Add multiple designs at once, one per line (admin)",
+        description="Add several image-less designs at once, one per line (admin)",
     )
     @app_commands.describe(
         entries=(
@@ -242,8 +365,9 @@ class FestivalCog(commands.Cog):
                 "Existing votes still point to this design correctly (they're stored by ID), "
                 "but consider announcing the name change to voters."
             )
+        shown_name = f": **{updated['name']}**" if updated["name"] else ""
         await interaction.response.send_message(
-            f"✅ Design **{updated['number']}** updated: **{updated['name']}**{who}{note}",
+            f"✅ Design **{updated['number']}** updated{shown_name}{who}{note}",
             ephemeral=True,
         )
 
@@ -276,12 +400,62 @@ class FestivalCog(commands.Cog):
             )
             return
 
+        await interaction.response.defer(ephemeral=True)
         db.remove_design(design["id"])
-        await interaction.response.send_message(
-            f"🗑️ Removed Design **{design_number} — {design['name']}**. "
+
+        # Also take down the bot's public image post for this design, if it has one.
+        post_removed = False
+        if design.get("image_channel_id") and design.get("image_message_id"):
+            try:
+                channel = interaction.guild.get_channel(
+                    design["image_channel_id"]
+                ) or await interaction.guild.fetch_channel(design["image_channel_id"])
+                await channel.get_partial_message(design["image_message_id"]).delete()
+                post_removed = True
+            except (discord.HTTPException, AttributeError):
+                pass
+
+        extra = " and its image post" if post_removed else ""
+        await interaction.followup.send(
+            f"🗑️ Removed **Design {design_number}**{extra}. "
             f"Note: remaining design numbers were not renumbered.",
             ephemeral=True,
         )
+
+    # -- /designs -------------------------------------------------------------
+    @app_commands.command(
+        name="designs",
+        description="Private list of which design number belongs to whom (admin)",
+    )
+    @is_admin()
+    async def designs(self, interaction: discord.Interaction):
+        festival = db.get_latest_festival(interaction.guild_id)
+        if not festival:
+            await interaction.response.send_message(
+                "⚠️ There's no festival yet.", ephemeral=True
+            )
+            return
+
+        designs = db.get_designs(festival["id"])
+        if not designs:
+            await interaction.response.send_message(
+                "No designs have been added yet.", ephemeral=True
+            )
+            return
+
+        lines = []
+        for d in designs:
+            who = f"<@{d['submitter_id']}>" if d["submitter_id"] else "unknown"
+            url = _jump_url(interaction.guild_id, d)
+            link = f" — [view]({url})" if url else ""
+            lines.append(f"**Design {d['number']}** → {who}{link}")
+
+        embed = discord.Embed(
+            title=f"Designs in festival #{festival['id']} (admin only)",
+            description="\n".join(lines)[:4000],
+            color=discord.Color.orange(),
+        )
+        await interaction.response.send_message(embed=embed, ephemeral=True)
 
     # -- /ballots -------------------------------------------------------------
     @app_commands.command(
@@ -308,9 +482,9 @@ class FestivalCog(commands.Cog):
         for b in ballots:
             lines.append(
                 f"<@{b['user_id']}>: "
-                f"🥇 Design {b['first_number']} ({b['first_name']}) — "
-                f"🥈 Design {b['second_number']} ({b['second_name']}) — "
-                f"🥉 Design {b['third_number']} ({b['third_name']})"
+                f"🥇 {_design_label(b['first_number'], b['first_submitter'])} — "
+                f"🥈 {_design_label(b['second_number'], b['second_submitter'])} — "
+                f"🥉 {_design_label(b['third_number'], b['third_submitter'])}"
             )
         full_text = "\n".join(lines)
 
@@ -353,10 +527,16 @@ class FestivalCog(commands.Cog):
             )
             return
 
+        # Only the number is shown (linked to the image post when there is one),
+        # plus the @submitter if this festival was set up to show them.
+        show_submitters = bool(festival.get("show_submitters"))
         lines = []
         for d in designs:
-            who = f" — <@{d['submitter_id']}>" if d["submitter_id"] else ""
-            lines.append(f"🖼️ Design {d['number']} — {d['name']}{who}")
+            url = _jump_url(interaction.guild_id, d)
+            line = f"🖼️ [Design {d['number']}]({url})" if url else f"🖼️ Design {d['number']}"
+            if show_submitters and d["submitter_id"]:
+                line += f" — <@{d['submitter_id']}>"
+            lines.append(line)
 
         embed = discord.Embed(
             title="🏆 DESIGN FESTIVAL",
@@ -365,8 +545,9 @@ class FestivalCog(commands.Cog):
                 "🥇 First Choice — **5 points**\n"
                 "🥈 Second Choice — **3 points**\n"
                 "🥉 Third Choice — **1 point**\n\n"
-                "Your votes are anonymous, and you get **one ballot**.\n\n"
-                "**Designs**\n" + "\n".join(lines)
+                "Your votes are anonymous, and you get **one ballot**.\n"
+                "You can't vote for your own design.\n\n"
+                "**Designs** (tap a number to jump to its image)\n" + "\n".join(lines)
             ),
             color=discord.Color.gold(),
         )
@@ -407,7 +588,7 @@ class FestivalCog(commands.Cog):
         lines = []
         for i, r in enumerate(results):
             marker = medals[i] if i < 3 else f"{i + 1}️⃣"
-            lines.append(f"{marker} Design {r['design']['number']} — {r['design']['name']} — {r['points']} pts")
+            lines.append(f"{marker} Design {r['design']['number']} — {r['points']} pts")
 
         vote_count = db.get_vote_count(festival["id"])
         status_note = " (voting still open)" if festival["status"] == "voting" else ""

@@ -5,7 +5,7 @@ Simple synchronous SQLite layer for the ZeamTeam design festival voting bot.
 Schema:
     festivals(id, guild_id, channel_id, message_id, status, created_at)
         status: 'setup' -> 'voting' -> 'ended'
-    designs(id, festival_id, number, name, submitter_id)
+    designs(id, festival_id, number, name, submitter_id, image_channel_id, image_message_id)
     votes(id, festival_id, user_id, first_design_id, second_design_id, third_design_id)
         UNIQUE(festival_id, user_id) -> enforces one ballot per user per festival
 """
@@ -56,6 +56,24 @@ def init_db():
             """
         )
 
+        # Lightweight migration: older databases (including one already living
+        # on your host) don't have this column yet. 1 = show submitter @names
+        # in the public festival post, 0 = hide them (the default).
+        columns = [r["name"] for r in conn.execute("PRAGMA table_info(festivals)")]
+        if "show_submitters" not in columns:
+            conn.execute(
+                "ALTER TABLE festivals ADD COLUMN show_submitters INTEGER NOT NULL DEFAULT 0"
+            )
+
+        # Lightweight migration: designs can now carry the bot's own image
+        # post (channel + message id). Older databases won't have these
+        # columns yet, so add them if missing.
+        existing = {row["name"] for row in conn.execute("PRAGMA table_info(designs)")}
+        if "image_channel_id" not in existing:
+            conn.execute("ALTER TABLE designs ADD COLUMN image_channel_id INTEGER")
+        if "image_message_id" not in existing:
+            conn.execute("ALTER TABLE designs ADD COLUMN image_message_id INTEGER")
+
 
 @contextmanager
 def get_conn():
@@ -73,13 +91,22 @@ def get_conn():
 # Festivals
 # ---------------------------------------------------------------------------
 
-def create_festival(guild_id: int, channel_id: int) -> int:
+def create_festival(guild_id: int, channel_id: int, show_submitters: bool = False) -> int:
     with get_conn() as conn:
         cur = conn.execute(
-            "INSERT INTO festivals (guild_id, channel_id, status) VALUES (?, ?, 'setup')",
-            (guild_id, channel_id),
+            "INSERT INTO festivals (guild_id, channel_id, status, show_submitters) "
+            "VALUES (?, ?, 'setup', ?)",
+            (guild_id, channel_id, 1 if show_submitters else 0),
         )
         return cur.lastrowid
+
+
+def set_show_submitters(festival_id: int, show: bool):
+    with get_conn() as conn:
+        conn.execute(
+            "UPDATE festivals SET show_submitters = ? WHERE id = ?",
+            (1 if show else 0, festival_id),
+        )
 
 
 def get_active_festival(guild_id: int):
@@ -128,17 +155,42 @@ def set_festival_status(festival_id: int, status: str):
 # Designs
 # ---------------------------------------------------------------------------
 
-def add_design(festival_id: int, name: str, submitter_id: int | None) -> tuple[int, int]:
-    """Adds a design, auto-numbering it. Returns (design_id, number)."""
+def next_design_number(festival_id: int) -> int:
     with get_conn() as conn:
         row = conn.execute(
             "SELECT COALESCE(MAX(number), 0) + 1 AS next_num FROM designs WHERE festival_id = ?",
             (festival_id,),
         ).fetchone()
-        number = row["next_num"]
+        return row["next_num"]
+
+
+def design_number_taken(festival_id: int, number: int) -> bool:
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT 1 FROM designs WHERE festival_id = ? AND number = ?",
+            (festival_id, number),
+        ).fetchone()
+        return row is not None
+
+
+def add_design(
+    festival_id: int,
+    name: str,
+    submitter_id: int | None,
+    number: int | None = None,
+    image_channel_id: int | None = None,
+    image_message_id: int | None = None,
+) -> tuple[int, int]:
+    """Adds a design. If number is None it's auto-numbered (next free number
+    in this festival). Returns (design_id, number)."""
+    if number is None:
+        number = next_design_number(festival_id)
+    with get_conn() as conn:
         cur = conn.execute(
-            "INSERT INTO designs (festival_id, number, name, submitter_id) VALUES (?, ?, ?, ?)",
-            (festival_id, number, name, submitter_id),
+            """INSERT INTO designs
+               (festival_id, number, name, submitter_id, image_channel_id, image_message_id)
+               VALUES (?, ?, ?, ?, ?, ?)""",
+            (festival_id, number, name, submitter_id, image_channel_id, image_message_id),
         )
         return cur.lastrowid, number
 
@@ -248,9 +300,9 @@ def get_ballots(festival_id: int):
             """
             SELECT
                 v.user_id,
-                d1.number AS first_number,  d1.name AS first_name,
-                d2.number AS second_number, d2.name AS second_name,
-                d3.number AS third_number,  d3.name AS third_name
+                d1.number AS first_number,  d1.submitter_id AS first_submitter,
+                d2.number AS second_number, d2.submitter_id AS second_submitter,
+                d3.number AS third_number,  d3.submitter_id AS third_submitter
             FROM votes v
             JOIN designs d1 ON d1.id = v.first_design_id
             JOIN designs d2 ON d2.id = v.second_design_id
